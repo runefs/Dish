@@ -107,14 +107,13 @@ and Role<'playerType>(player : 'playerType, roleTypeObject : obj) as this =
     do
        this._player <- player
        this._role <- roleTypeObject
+
 type private Local =
     Address of int16
     | ShortAddress of byte
     | Builder of LocalBuilder
     | Ordinal of int16
-type private This = 
-    RoleSelf
-    | Player
+    
 type private Value = 
       Byte of OpCode * byte
     | SByte of OpCode * sbyte
@@ -125,62 +124,83 @@ type private Value =
     | Float of OpCode * float
     | String of string
     | Local of Local
+    | ThisRole
+    | ThisPlayer
+
+[<RequireQualifiedAccess>]
+type Store =
     | Field of OpCode * FieldInfo
-    | This of This
+    | Local of Local
+
 type private Unary = 
-    | StoreField of OpCode * FieldInfo
-    | StoreLocal of Local
+    | Field of OpCode * FieldInfo
+    | Cast of OpCode * Type 
+    | Create of OpCode * Type
 type private Binary =
     | Equal
     | Subtraction
-
-type private Nnary = 
+    | ArrayElement of OpCode * Type
+type private Call = 
    MethodCall of OpCode * MethodInfo
    | CtorCall of OpCode * ConstructorInfo
+type Statement = 
+    Type
+    | Store of Store
+type Expression = 
+    Value of Value
+    | Call of operandCount: int * Call
+    | Binary
+    
 type private Instruction =
-    Simple of OpCode
-    | Nnary of operandCount: int * Nnary
+    Statement of Statement
+    | Expression of Expression
     | TypeOperation of OpCode * Type
-    | Value of Value
     | Switch of Label []
     | Unary of Unary
-    | Comparison of Binary
-    | Computation of Binary
+    
 type private Operation =
    Leaf of Instruction
    | Operation of Instruction * Operation list
    | Nop
+
 let isPlayerType (playerInterface : System.Type) (declaringType : System.Type) =
     declaringType.IsAssignableTo playerInterface
     
 let private rewriteThis (playerType : System.Type) roleType instructions = 
     let rec usePlayer inst =
         match inst with
-        Leaf(Value(This(RoleSelf))) -> Leaf(Value(This(Player)))
+        | Leaf(Expression(Value(ThisRole))) -> ThisPlayer |> Value |> Expression |> Leaf
         | Operation(i,operands) -> 
-            let i,operands = 
-                match i with 
-                Value(This(RoleSelf)) -> Value(This(Player)),operands |> List.map usePlayer
-                | Nnary(count,MethodCall(opc,mi)) ->
-                    
-                    let mi,operands = 
-                        if isPlayerType playerType mi.DeclaringType then
-                            
-                            let operands = 
-                                operands
-                                |> List.map usePlayer
-                            playerType.GetMethod(mi.Name),operands
-                        else
-                            let instance = 
-                                operands |> List.head
-                            let arguments = 
-                                operands
-                                |> List.tail
-                                |> List.map usePlayer
-                            mi,instance::arguments
-                    //assert(count = operands.Length)
-                    Nnary(count,MethodCall(opc,mi)),operands
-                | i -> i,operands |> List.map usePlayer
+            let operands = operands |> List.map usePlayer
+            let i = 
+                match i with
+                Expression e ->
+                    let exp = 
+                        match e with 
+                        Value(ThisRole) -> Value(ThisPlayer)
+                        | Call(count,MethodCall(opc,mi)) ->
+                            let mi,operands = 
+                                if isPlayerType playerType mi.DeclaringType then
+                                    
+                                    let operands = 
+                                        operands
+                                        |> List.map usePlayer
+                                    playerType.GetMethod(mi.Name),operands
+                                else
+                                    let instance = 
+                                        operands |> List.head
+                                    let arguments = 
+                                        operands
+                                        |> List.tail
+                                        |> List.map usePlayer
+                                    mi,instance::arguments
+                            //assert(count = operands.Length)
+                            Call(count,MethodCall(opc,mi)),operands
+                        | i -> i
+                    exp |> Expression
+                | Statement s ->
+                    match s with
+                    _ -> failwith "not implemented"
             Operation(i,operands)
         | op -> op
     
@@ -273,30 +293,38 @@ let createRole<'final, 'a, 'player when 'final : not struct> (player : 'player) 
                         mi.GetParameters().Length
                     else
                         mi.GetParameters().Length + 1
-                Nnary(argCount,MethodCall(op,mi))
+                Call(argCount,MethodCall(op,mi)) |> Expression
             | op when ((op = OpCodes.Call 
                        || op = OpCodes.Callvirt
                        || op = OpCodes.Newobj) && inst.Operand :? ConstructorInfo) ->
                 let ci = inst.Operand :?> ConstructorInfo
-                Nnary(ci.GetParameters().Length,CtorCall(op,ci))
+                Call(ci.GetParameters().Length,CtorCall(op,ci)) |> Expression
             | op when op = OpCodes.Calli -> failwith "Calli not supported"
-            | op when (op = OpCodes.Box
-                       || op = OpCodes.Castclass 
-                       || op = OpCodes.Cpobj
-                       || op = OpCodes.Initobj
-                       || op = OpCodes.Isinst
-                       || op = OpCodes.Ldelem
-                       || op = OpCodes.Ldelema
-                       || op = OpCodes.Ldobj
-                       || op = OpCodes.Ldtoken
-                       || op = OpCodes.Mkrefany
-                       || op = OpCodes.Newarr
-                       || op = OpCodes.Refanyval
-                       || op = OpCodes.Sizeof
-                       || op = OpCodes.Stelem
-                       || op = OpCodes.Stobj
-                       || op = OpCodes.Unbox
-                       || op = OpCodes.Unbox_Any) ->
+            | op when inst.Operand :? System.Type -> 
+                let typeOperand = inst.Operand :?> System.Type
+                match op with
+                op when (op = OpCodes.Ldtoken //0 -> 1
+                        || op = OpCodes.Sizeof) //0 -> 1
+                          Statement(Type)
+                op when (op = OpCodes.Box
+                         || op = OpCodes.Castclass
+                         || op = OpCodes.Unbox
+                         || op = OpCodes.Unbox_Any
+                         ||op = OpCodes.Isinst) ->
+                         Expression(Cast(op,typeOperand))
+                op when (op = OpCodes.Ldobj
+                         || op = OpCodes.Mkrefany
+                         || op = OpCodes.Newarr
+                         || op = OpCodes.Refanyval) ->
+                        Expression(Create(op,typeOperand))
+                op when (|| op = OpCodes.Ldelem
+                         || op = OpCodes.Ldelema)
+                         Expression(Binary ArrayElement(op,typeOperand))
+                op when (OpCodes.Cpobj //2 -> 0
+                         || op = OpCodes.Stobj // 2 -> 0
+                         || op = OpCodes.Stelem // 3 -> 0
+                         || op = OpCodes.Initobj //1 -> 0
+                       ) ->
                 TypeOperation(op,inst.Operand :?> System.Type)
             | op when (op = OpCodes.Ldarga
                        || op = OpCodes.Starg) ->
