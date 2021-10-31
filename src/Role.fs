@@ -22,10 +22,11 @@ let defineType name =
         TypeAttributes.Public
     )
 
-type private RoleMetaObject<'playerType,'roleType>(expr : Expression, roleContainer : Role<'playerType>) = 
+type private RoleMetaObject<'player,'role>(expr : Expression, roleContainer : Role<'player,'role>) = 
     inherit DynamicMetaObject(expr, BindingRestrictions.Empty, roleContainer)
-    let playerType = typeof<'playerType>
-    let roleType = roleContainer.RoleTypeObject.GetType()
+    let rewritter (exp : Expression) = ExpressionTreeRewritter(roleContainer).Visit exp
+    let playerType = typeof<'player>
+    let roleType = typeof<'role>
     override this.BindSetMember(binder,value) =
         let restrictions =
              BindingRestrictions.GetTypeRestriction(this.Expression, this.LimitType)
@@ -54,9 +55,9 @@ type private RoleMetaObject<'playerType,'roleType>(expr : Expression, roleContai
 
     override this.BindInvokeMember(binder,args) =
         
-        let method = roleType.GetMethod(binder.Name)
         let method = 
-            if method |> isNull || method.IsAbstract then
+            match roleType.GetMethod(binder.Name) with
+            method when (method |> isNull || method.IsAbstract) ->
                 let methods = 
                     //doesn't work because the interfaces are not part of the newly created type
                     roleType.GetInterfaces()
@@ -64,432 +65,104 @@ type private RoleMetaObject<'playerType,'roleType>(expr : Expression, roleContai
                 methods
                 |> Array.filter(fun m -> m.Name = binder.Name)
                 |> Array.tryHead
-            else Some method
+            | method -> Some method
         let restrictions =
             BindingRestrictions.GetTypeRestriction(this.Expression, this.LimitType)
-        let this,method = 
+        let returnVal = 
             match method with
             Some method ->
-                roleContainer.RoleTypeObjectExpression,method
-            | None ->
-                roleContainer.PlayerExpression,playerType.GetMethod(binder.Name)
-        assert(method |> isNull |> not)
-        let args = 
-            args
-            |> Array.zip (method.GetParameters())
-            |> Array.map(fun (p,arg) -> Expression.Convert(arg.Expression, p.ParameterType) :> Expression) 
-        let call = Expression.Call(this,method,args)
-        let returnVal = 
-            if method.ReturnType = typeof<System.Void> then
+                let expressionTree,pars,vars = ExpressionTree.methodToExpressionTree true method
+                let variables = 
+                    pars
+                    |> List.fold(fun variables p -> 
+                        variables 
+                        |> Map.add p.Name (Expression.Variable(p.Type,p.Name))
+                    ) vars
+                     
+                let assignments = 
+                    Expression.Assign(variables.["this"],Expression.Convert(Expression.Constant(null), roleType)) :> Expression //should be dynmically bound to role, needs rewrite of tree
+                    ::(args
+                       |> Array.zip (method.GetParameters())
+                       |> Array.map(fun (p,arg) -> Expression.Assign(variables.[sprintf "%s____param__%s" method.Name p.Name], 
+                                                                  Expression.Convert(arg.Expression, p.ParameterType)) :> Expression)
+                       |> List.ofArray)
+                
+                let methodBody = 
+                    match rewritter expressionTree.Expression with
+                    :? BlockExpression as be -> 
+                        let exprs = be.Expressions |> Seq.toList
+                        if be.Type = typeof<System.Void> || be.Type = typeof<unit> then
+                            exprs@[Expression.Default(typeof<obj>)]
+                        else
+                            let reversed = exprs |> List.rev
+                            (Expression.Convert(reversed.Head, typeof<obj>) :> Expression)
+                            ::(reversed.Tail)
+                            |> List.rev
+
+                    | e -> [e]
+                
                 Expression.Block(
-                    call,
-                    Expression.Default(typeof<obj>)
+                    (variables |>Map.toList |> List.map snd),
+                    assignments@methodBody
                 ) :> Expression
-            else
-                Expression.Convert(call, typeof<obj>) :> Expression
+            | None ->
+                let method = playerType.GetMethod(binder.Name)
+                let args = 
+                   args
+                    |> Array.zip (method.GetParameters())
+                    |> Array.map(fun (p,arg) -> Expression.Convert(arg.Expression, p.ParameterType) :> Expression) 
+                let expr = Expression.Call(roleContainer.PlayerExpression,method,args) :> Expression
+                if method.ReturnType = typeof<System.Void> || method.ReturnType = typeof<unit> then
+                    Expression.Block(
+                        expr,
+                        Expression.Default(typeof<obj>)
+                    ) :> Expression
+                else
+                    Expression.Convert(expr, typeof<obj>) :> Expression
+       
         DynamicMetaObject(returnVal,restrictions)
         
-and Role<'playerType>(player : 'playerType, roleTypeObject : obj) as this = 
-    [<DefaultValue>] val mutable private _player : 'playerType
-    [<DefaultValue>] val mutable private _role : obj
+and Role<'player,'role>(player : 'player) as this = 
+    [<DefaultValue>] val mutable private _player : 'player
+    
     
     let playerExpr = 
         Expression.Field(Expression.Constant this, "_player") :> Expression
-    let roleTypeObjectExpr = 
-        Expression.Convert(Expression.Field(Expression.Constant this, "_role"),roleTypeObject.GetType()) :> Expression
     member internal __.PlayerExpression with get() = playerExpr
-    member internal __.RoleTypeObjectExpression with get() = roleTypeObjectExpr
-    member internal __.RoleTypeObject with get() = roleTypeObject
+    
     interface IDynamicMetaObjectProvider with
 
       member this.GetMetaObject expr = 
           RoleMetaObject(expr, this) :> DynamicMetaObject
     do
        this._player <- player
-       this._role <- roleTypeObject
 
-type private Local =
-    Address of int16
-    | ShortAddress of byte
-    | Builder of LocalBuilder
-    | Ordinal of int16
+and ExpressionTreeRewritter<'player, 'role>(roleContainer : Role<'player, 'role>) = 
+    inherit ExpressionVisitor()
+    let playerExpression = roleContainer.PlayerExpression
+    let roleType = typeof<'role>
+    let isPlayer (exp : Expression) = 
+        exp.Type = playerExpression.Type
+        || exp.Type.IsAssignableFrom playerExpression.Type
+    let isRole (exp : Expression) = 
+        //TODO: this fails when two roles have the same type
+        exp.Type = roleType
     
-type private Value = 
-      Byte of OpCode * byte
-    | SByte of OpCode * sbyte
-    | Int16 of OpCode * int16
-    | Int of OpCode * int
-    | Single of OpCode * single
-    | Int64 of OpCode * int64
-    | Float of OpCode * float
-    | String of string
-    | Local of Local
-    | ThisRole
-    | ThisPlayer
-
-[<RequireQualifiedAccess>]
-type Store =
-    | Field of OpCode * FieldInfo
-    | Local of Local
-
-type private Unary = 
-    | Field of OpCode * FieldInfo
-    | Cast of OpCode * Type 
-    | Create of OpCode * Type
-type private Binary =
-    | Equal
-    | Subtraction
-    | ArrayElement of OpCode * Type
-type private Call = 
-   MethodCall of OpCode * MethodInfo
-   | CtorCall of OpCode * ConstructorInfo
-type Statement = 
-    Type
-    | Store of Store
-type Expression = 
-    Value of Value
-    | Call of operandCount: int * Call
-    | Binary
-    
-type private Instruction =
-    Statement of Statement
-    | Expression of Expression
-    | TypeOperation of OpCode * Type
-    | Switch of Label []
-    | Unary of Unary
-    
-type private Operation =
-   Leaf of Instruction
-   | Operation of Instruction * Operation list
-   | Nop
-
-let isPlayerType (playerInterface : System.Type) (declaringType : System.Type) =
-    declaringType.IsAssignableTo playerInterface
-    
-let private rewriteThis (playerType : System.Type) roleType instructions = 
-    let rec usePlayer inst =
-        match inst with
-        | Leaf(Expression(Value(ThisRole))) -> ThisPlayer |> Value |> Expression |> Leaf
-        | Operation(i,operands) -> 
-            let operands = operands |> List.map usePlayer
-            let i = 
-                match i with
-                Expression e ->
-                    let exp = 
-                        match e with 
-                        Value(ThisRole) -> Value(ThisPlayer)
-                        | Call(count,MethodCall(opc,mi)) ->
-                            let mi,operands = 
-                                if isPlayerType playerType mi.DeclaringType then
-                                    
-                                    let operands = 
-                                        operands
-                                        |> List.map usePlayer
-                                    playerType.GetMethod(mi.Name),operands
-                                else
-                                    let instance = 
-                                        operands |> List.head
-                                    let arguments = 
-                                        operands
-                                        |> List.tail
-                                        |> List.map usePlayer
-                                    mi,instance::arguments
-                            //assert(count = operands.Length)
-                            Call(count,MethodCall(opc,mi)),operands
-                        | i -> i
-                    exp |> Expression
-                | Statement s ->
-                    match s with
-                    _ -> failwith "not implemented"
-            Operation(i,operands)
-        | op -> op
-    
-    let operations =
-        let stack =  
-            instructions
-            |> List.ofSeq
-            |> List.fold(fun (stack : Operation list) current ->
-                let pop n =
-                    let operands = 
-                       stack
-                       |> List.take n
-                       |> List.rev
-                    let stack =
-                       stack
-                       |> List.skip n
-                    Operation(current,operands)::stack
-                match current with
-                Simple _  
-                | Value _ -> (Leaf current)::stack
-                | Nnary(c,_) -> 
-                    pop c
-                | Unary _ ->
-                    pop 1
-                | Comparison _
-                | Computation _ -> 
-                    pop 2
-                | TypeOperation _ 
-                | Switch _ -> failwith "Not implemented"
-            ) []
-        
-        let operations = stack|> List.rev
-        operations
-        |> List.map usePlayer
-    
-    let rec flattenTree tree res =
-        match tree with
-        Leaf(i)::tree -> flattenTree tree (i::res)
-        | Nop::tree-> flattenTree tree res
-        | Operation(i,operands)::tree ->
-            let operands = flattenTree operands []
-            flattenTree tree (i::(operands@res))
-        | [] -> res
-    flattenTree operations []
-    |> List.rev
-
-let createRole<'final, 'a, 'player when 'final : not struct> (player : 'player) = 
-   
-    let roleType = typeof<'a>
-    let playerType = typeof<'player>
-    let createConstructor (field : FieldInfo) (t : TypeBuilder) = 
-        let constructorArgs = [| typeof<'player> |]
-        let ctor =
-           t.DefineConstructor(MethodAttributes.Public,
-                               CallingConventions.Standard, constructorArgs)
-        ctor.DefineParameter(0,ParameterAttributes.None,"player") |> ignore
-        let ilg = ctor.GetILGenerator()
-        let objCtor = typeof<obj>.GetConstructor([||]);
-        ilg.Emit(OpCodes.Ldarg_0)
-        ilg.Emit(OpCodes.Call, objCtor)
-        ilg.Emit(OpCodes.Ldarg_0)
-        ilg.Emit(OpCodes.Ldarg_1)
-        ilg.Emit(OpCodes.Stfld, field)
-        ilg.Emit(OpCodes.Ret)
-    let t = typeof<'a>
-    let props = t.GetProperties()
-    let copyType = defineType (t.Name + ".Dish")
-    //copyType.AddInterfaceImplementation(typeof<'final>)
-    let playerField = copyType.DefineField("__player__",typeof<'player>,FieldAttributes.Private)
-    
-    createConstructor playerField copyType
-    let propBuilders = 
-        props
-        |> Array.map(fun p -> 
-            copyType.DefineProperty(p.Name,p.Attributes,p.PropertyType,[||])
-        )
-    let readInstructions (instructions : seq<Mono.Reflection.Instruction>) = 
-        instructions
-        |> Seq.map(fun inst ->
-            printfn "Inst: %A" inst.OpCode
-            match inst.OpCode with
-            | op when ((op = OpCodes.Call 
-                       || op = OpCodes.Callvirt 
-                       || op = OpCodes.Ldtoken
-                       || op = OpCodes.Ldvirtftn
-                       || op = OpCodes.Ldftn) && inst.Operand :? MethodInfo) ->
-                let mi = inst.Operand :?> MethodInfo
-                let argCount = 
-                    if mi.IsStatic then 
-                        mi.GetParameters().Length
-                    else
-                        mi.GetParameters().Length + 1
-                Call(argCount,MethodCall(op,mi)) |> Expression
-            | op when ((op = OpCodes.Call 
-                       || op = OpCodes.Callvirt
-                       || op = OpCodes.Newobj) && inst.Operand :? ConstructorInfo) ->
-                let ci = inst.Operand :?> ConstructorInfo
-                Call(ci.GetParameters().Length,CtorCall(op,ci)) |> Expression
-            | op when op = OpCodes.Calli -> failwith "Calli not supported"
-            | op when inst.Operand :? System.Type -> 
-                let typeOperand = inst.Operand :?> System.Type
-                match op with
-                op when (op = OpCodes.Ldtoken //0 -> 1
-                        || op = OpCodes.Sizeof) //0 -> 1
-                          Statement(Type)
-                op when (op = OpCodes.Box
-                         || op = OpCodes.Castclass
-                         || op = OpCodes.Unbox
-                         || op = OpCodes.Unbox_Any
-                         ||op = OpCodes.Isinst) ->
-                         Expression(Cast(op,typeOperand))
-                op when (op = OpCodes.Ldobj
-                         || op = OpCodes.Mkrefany
-                         || op = OpCodes.Newarr
-                         || op = OpCodes.Refanyval) ->
-                        Expression(Create(op,typeOperand))
-                op when (|| op = OpCodes.Ldelem
-                         || op = OpCodes.Ldelema)
-                         Expression(Binary ArrayElement(op,typeOperand))
-                op when (OpCodes.Cpobj //2 -> 0
-                         || op = OpCodes.Stobj // 2 -> 0
-                         || op = OpCodes.Stelem // 3 -> 0
-                         || op = OpCodes.Initobj //1 -> 0
-                       ) ->
-                TypeOperation(op,inst.Operand :?> System.Type)
-            | op when (op = OpCodes.Ldarga
-                       || op = OpCodes.Starg) ->
-                Value(Int16(op,inst.Operand |> unbox |> int16))
-            | op when (op = OpCodes.Ldarga_S
-                       || op = OpCodes.Starg_S) ->
-                Value(Byte(op,inst.Operand |> unbox |> byte))
-            | op when op = OpCodes.Ldc_I4 ->
-                Value(Int(op,inst.Operand |> unbox |> int32))
-            | op when (op = OpCodes.Ldc_I4_S && inst.Operand :? byte) ->
-               Value(Byte(op,inst.Operand |> unbox |> byte))
-            | op when (op = OpCodes.Ldc_I4_S) ->
-                Value(SByte(op,inst.Operand |> unbox |> sbyte))
-            | op when op = OpCodes.Ldc_I8 ->
-                Value(Int64(op,inst.Operand |> unbox |> int64))
-            | op when op = OpCodes.Ldc_R4 ->
-                Value(Single(op,inst.Operand |> unbox |> single))
-            | op when op = OpCodes.Ldc_R8 ->
-                Value(Float(op,inst.Operand |> unbox |> float))
-            | op when (op = OpCodes.Ldfld
-                       || op = OpCodes.Ldflda 
-                       || op = OpCodes.Ldsfld
-                       || op = OpCodes.Ldsflda
-                       || (op = OpCodes.Ldtoken && inst.Operand :? FieldInfo) ) -> 
-                Value(Field(op,inst.Operand :?> FieldInfo))
-            | op when (op = OpCodes.Stfld
-                       || op = OpCodes.Stsfld ) -> 
-                StoreField(op,inst.Operand :?> FieldInfo) |> Unary
-            | op when op = OpCodes.Ldarg_0 ->
-                RoleSelf |> This |> Value 
-            | op when ((op = OpCodes.Ldloc) && inst.Operand :? int16) ->
-                Value(Local(Ordinal(inst.Operand |> unbox |> int16)))
-            | op when ((op = OpCodes.Ldloca) && inst.Operand :? int16) ->
-                Value(Local(Address(inst.Operand |> unbox |> int16)))
-            | op when ((op = OpCodes.Stloc) && inst.Operand :? int16) ->
-                StoreLocal(Ordinal(inst.Operand |> unbox |> int16)) |> Unary
-            | op when (op = OpCodes.Ldloc && inst.Operand :? LocalBuilder) ->
-                Value(Local(Builder(inst.Operand :?> LocalBuilder)))
-            | op when (op = OpCodes.Ldloca_S) ->
-                Value(Local(ShortAddress(inst.Operand |> unbox |> byte)))
-            | op when (op = OpCodes.Stloc_S) ->
-                StoreLocal(ShortAddress(inst.Operand |> unbox |> byte)) |> Unary
-            | op when op = OpCodes.Ldstr ->
-                Value(String(inst.Operand :?> string))
-            | op when op = OpCodes.Switch ->
-                Switch(inst.Operand :?> Label [])
-            | op when op = OpCodes.Sub ->
-                Computation(Subtraction)
-            | op -> Simple op 
-        ) 
-    
-    let emit (ilg : ILGenerator)= function 
-        Simple(op) -> 
-            printfn "%A" op
-            ilg.Emit(op)
-        | Nnary(_,operation) ->
-            match operation with
-            MethodCall(op,mi) -> 
-                printfn "%A - %s.%s" op mi.DeclaringType.Name mi.Name
-                ilg.Emit(op,mi)
-            | CtorCall(op,operand) -> ilg.Emit(op,operand)
-        | Comparison operation -> 
-             match operation with
-             Equal -> ilg.Emit(OpCodes.Ceq)
-             | o -> failwithf "Not a comparison operator (%A)" o
-        | Computation operation -> 
-             match operation with
-             Subtraction -> 
-                printfn "OpCodes.Sub"
-                ilg.Emit(OpCodes.Sub)
-             | o -> failwithf "Not a computation operator (%A)" o
-        | Unary operation ->
-            match operation with
-            StoreField(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | StoreLocal local ->
-                match local with
-                Address _ -> failwith "Should be ordinal"
-                | ShortAddress a -> ilg.Emit(OpCodes.Stloc_S,a)
-                | Builder b -> ilg.Emit(OpCodes.Stloc,b)
-                | Ordinal o -> ilg.Emit(OpCodes.Stloc,o)
-        | TypeOperation(op,operand) -> 
-            printfn "%A" op
-            ilg.Emit(op,operand)
-        | Value value ->
-            match value with
-            Byte(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | SByte(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | Int16(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | Int(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | Single(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | Int64(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | Float(op,operand) -> 
-                printfn "%A" op
-                ilg.Emit(op,operand)
-            | String(str) -> 
-                printfn "OpCodes.Ldstr"
-                ilg.Emit(OpCodes.Ldstr,str)
-            | Local(loc) ->
-                match loc with
-                Address a -> ilg.Emit(OpCodes.Ldloca,a)
-                | ShortAddress a -> ilg.Emit(OpCodes.Ldloca_S,a)
-                | Builder b -> ilg.Emit(OpCodes.Ldloc,b)
-                | Ordinal o -> ilg.Emit(OpCodes.Ldloc,o)
-            | Field(op,field) -> 
-                printfn "%A, %s.%s" op field.DeclaringType.Name field.Name
-                ilg.Emit(op,field)
-            | This RoleSelf -> 
-                printfn "OpCodes.Ldarg_0" 
-                ilg.Emit(OpCodes.Ldarg_0)
-            | This Player ->
-                printfn "OpCodes.Ldarg_0"
-                printfn "OpCodes.Ldfld (this), %s.%s" playerField.DeclaringType.Name playerField.Name
-                ilg.Emit(OpCodes.Ldarg_0)
-                ilg.Emit(OpCodes.Ldfld, playerField)
-        | Switch(labels) -> ilg.Emit(OpCodes.Switch,labels)
-    let methodBuilders = 
-        t.GetMethods()
-        |> Array.append (t.GetMethods(BindingFlags.NonPublic))
-        |> Array.filter(fun meth -> 
-            let isConcreteMethod = (meth.IsAbstract || meth.IsConstructor) |> not
-            isConcreteMethod && meth.DeclaringType = t
-        ) |> Array.map(fun meth ->
-            let parameterTypes = meth.GetParameters() |> Array.map(fun p -> p.ParameterType)
-            let s = 
-                System.String.Join(" -> ",parameterTypes
-                                          |> Array.map(fun t -> t.FullName))
-
-            let returnType = meth.ReturnType
-            printfn "Copying %s : %s -> %s" meth.Name s returnType.Name
-            let m = copyType.DefineMethod(meth.Name, 
-                                          meth.Attributes, 
-                                          meth.CallingConvention, 
-                                          returnType, 
-                                          parameterTypes)
-                                          
-            let ilg = m.GetILGenerator()
-            let instructions = 
-                Mono.Reflection.Disassembler.GetInstructions meth
-                |> Seq.filter(fun i -> i.OpCode <> OpCodes.Nop)
-                |> readInstructions
-
-            let methodBody = 
-                instructions
-                |> rewriteThis playerType roleType
-            assert(instructions |> Seq.length = methodBody.Length)
-            methodBody
-            |> Seq.iter(emit ilg)
-            m       
-    )
-    let newT = copyType.CreateType()
-    let args : obj[] = [|player|]
-    let roleObj = System.Activator.CreateInstance(newT,args)
-   
-    Role(player,roleObj).ActLike<'final>()
+    override  __.VisitMethodCall methodCall =   
+        let instance = 
+            match methodCall.Object with
+            instance when instance |> isPlayer -> playerExpression
+            | instance when instance |> isRole ->
+                //TODO rewrite to dynamic binding
+                instance
+            | instance -> instance
+        let args = 
+            methodCall.Arguments
+            |> Seq.map(function
+                arg when arg |> isRole -> 
+                   playerExpression
+                | arg -> arg
+            )
+        Expression.Call(instance, methodCall.Method,args) :> Expression
+let createRole<'final, 'role, 'player when 'final : not struct> (player : 'player) = 
+    Role<'player,'role>(player).ActLike<'final>()

@@ -109,7 +109,7 @@ module Program =
                 Ledger = []
             }.Deposit("Initial deposit", 0m)
         let ctx = MoneyTransferContext(source,sink)
-        let source,sink = ctx.Transfer "Monday night dinner" "Payment for Dinner from me" 250m
-        printfn "Source account %A" source
-        printfn "Sink account %A" sink
+        let src,snk = ctx.Transfer "Monday night dinner" "Payment for Dinner from me" 250m
+        printfn "Source account %A" src
+        printfn "Sink account %A" snk
         0

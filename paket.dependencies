@@ -2,6 +2,9 @@ source https://api.nuget.org/v3/index.json
 
 storage: none
 framework: net5.0, netstandard2.0, netstandard2.1
+
+
 nuget fsharp.interop.dynamic
 nuget impromptuinterface
+nuget mono.Linq.Expressions
 nuget Mono.Reflection

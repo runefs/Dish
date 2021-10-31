@@ -1,0 +1,3 @@
+[submodule "Seeds"]
+	path = Seeds
+	url = https://github.com/runefs/seeds.git

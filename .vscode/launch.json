@@ -10,7 +10,7 @@
             "type": "coreclr",
             "request": "launch",
             "preLaunchTask": "build",
-            "program": "${workspaceFolder}/src/Disc/bin/Debug/net5.0/disc.dll",
+            "program": "${workspaceFolder}/src/bin/Debug/net5.0/dish.dll",
             "args": [],
             "cwd": "${workspaceFolder}/src",
             "stopAtEntry": false,
