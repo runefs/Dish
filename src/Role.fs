@@ -71,16 +71,11 @@ type private RoleMetaObject<'player,'role>(expr : Expression, roleContainer : Ro
         let returnVal = 
             match method with
             Some method ->
-                let expressionTree,pars,vars = ExpressionTree.methodToExpressionTree true method
-                let variables = 
-                    pars
-                    |> List.fold(fun variables p -> 
-                        variables 
-                        |> Map.add p.Name (Expression.Variable(p.Type,p.Name))
-                    ) vars
+                let expressionTree,_,variables = ExpressionTree.methodToExpressionTree true method
+                
                      
                 let assignments = 
-                    Expression.Assign(variables.["this"],Expression.Convert(Expression.Constant(null), roleType)) :> Expression //should be dynmically bound to role, needs rewrite of tree
+                    Expression.Assign(variables.[sprintf "%s____param__this" method.Name],Expression.Convert(Expression.Constant(null), roleType)) :> Expression //should be dynmically bound to role, needs rewrite of tree
                     ::(args
                        |> Array.zip (method.GetParameters())
                        |> Array.map(fun (p,arg) -> Expression.Assign(variables.[sprintf "%s____param__%s" method.Name p.Name], 
