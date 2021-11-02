@@ -5,7 +5,7 @@ NUGET
     Dynamitey (2.0.10.189)
       Microsoft.CSharp (>= 4.6)
       System.ComponentModel (>= 4.3)
-    FSharp.Core (6.0)
+    FSharp.Core (6.0.1)
     FSharp.Interop.Dynamic (5.0.1.268)
       Dynamitey (>= 2.0.10.189)
       FSharp.Core (>= 4.2.3)
