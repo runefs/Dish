@@ -154,6 +154,7 @@ and ExpressionTreeRewritter<'player, 'role>(roleContainer : Role<'player, 'role>
                 | arg -> arg
             ) |> List.ofSeq
         match methodCall.Object with
+        | null -> methodCall :> Expression
         | instance when instance |> isRole ->
             let args = (Expression.Constant(roleContainer) :> Expression)::args
             let binder = Binder.InvokeMember(
@@ -165,9 +166,10 @@ and ExpressionTreeRewritter<'player, 'role>(roleContainer : Role<'player, 'role>
                              |> List.map(fun _ -> CSharpArgumentInfo.Create(CSharpArgumentInfoFlags.None, null))
             )
             Expression.Convert(Expression.Dynamic(binder, typeof<obj>, args),methodCall.Method.ReturnType) :> Expression
-        | instance -> 
-            let instance = if instance |> isPlayer then playerExpression else instance
-            Expression.Call(instance, methodCall.Method,args) :> Expression
+        | instance when instance |> isPlayer ->
+            Expression.Call(instance, methodCall.Method,args) :> Expression 
+        | _ -> methodCall :> Expression
+            
         
         
    
