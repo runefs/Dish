@@ -81,8 +81,8 @@ module Program =
     type Sink() = 
         member this.Accept (msg:string) (amount:decimal) =
             printfn "Using dynimic lookup"
-            this.Dep msg amount
-        member this.Dep (msg:string) (amount:decimal) = 
+            this.Dep(msg, amount)
+        member this.Dep (msg:string,amount:decimal) = 
             (this :> ISinkPlayer).Deposit((msg,amount))
         abstract member Deposit : (string * decimal) -> Account
         interface ISinkPlayer with
