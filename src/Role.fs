@@ -5,6 +5,7 @@ open System.Reflection.Emit
 open System.Linq.Expressions
 open System 
 open ImpromptuInterface
+open Microsoft.CSharp.RuntimeBinder
 
 let mb = 
     let aName = AssemblyName("dish_runtim")
@@ -59,11 +60,12 @@ type private RoleMetaObject<'player,'role>(expr : Expression, roleContainer : Ro
             match roleType.GetMethod(binder.Name) with
             method when (method |> isNull || method.IsAbstract) ->
                 let methods = 
-                    //doesn't work because the interfaces are not part of the newly created type
                     roleType.GetInterfaces()
                     |> Array.collect(fun t -> t.GetMethods())
                 methods
-                |> Array.filter(fun m -> m.Name = binder.Name)
+                |> Array.filter(fun m -> 
+                    m.Name = binder.Name
+                    && not method.IsAbstract)
                 |> Array.tryHead
             | method -> Some method
         let restrictions =
@@ -72,10 +74,10 @@ type private RoleMetaObject<'player,'role>(expr : Expression, roleContainer : Ro
             match method with
             Some method ->
                 let expressionTree,_,variables = ExpressionTree.methodToExpressionTree true method
-                
-                     
+                let thisName = sprintf "%s____param__this" method.Name
+
                 let assignments = 
-                    Expression.Assign(variables.[sprintf "%s____param__this" method.Name],Expression.Convert(Expression.Constant(null), roleType)) :> Expression //should be dynmically bound to role, needs rewrite of tree
+                    Expression.Assign(variables.[thisName],Expression.Convert(Expression.Constant(null),roleType)) :> Expression //should be dynmically bound to role, needs rewrite of tree
                     ::(args
                        |> Array.zip (method.GetParameters())
                        |> Array.map(fun (p,arg) -> Expression.Assign(variables.[sprintf "%s____param__%s" method.Name p.Name], 
@@ -144,20 +146,31 @@ and ExpressionTreeRewritter<'player, 'role>(roleContainer : Role<'player, 'role>
         exp.Type = roleType
     
     override  __.VisitMethodCall methodCall =   
-        let instance = 
-            match methodCall.Object with
-            instance when instance |> isPlayer -> playerExpression
-            | instance when instance |> isRole ->
-                //TODO rewrite to dynamic binding
-                instance
-            | instance -> instance
         let args = 
             methodCall.Arguments
             |> Seq.map(function
                 arg when arg |> isRole -> 
                    playerExpression
                 | arg -> arg
+            ) |> List.ofSeq
+        match methodCall.Object with
+        | instance when instance |> isRole ->
+            let args = (Expression.Constant(roleContainer) :> Expression)::args
+            let binder = Binder.InvokeMember(
+                             CSharpBinderFlags.None,
+                             methodCall.Method.Name, 
+                             [||],
+                             roleType,
+                             args
+                             |> List.map(fun _ -> CSharpArgumentInfo.Create(CSharpArgumentInfoFlags.None, null))
             )
-        Expression.Call(instance, methodCall.Method,args) :> Expression
+            Expression.Convert(Expression.Dynamic(binder, typeof<obj>, args),methodCall.Method.ReturnType) :> Expression
+        | instance -> 
+            let instance = if instance |> isPlayer then playerExpression else instance
+            Expression.Call(instance, methodCall.Method,args) :> Expression
+        
+        
+   
+    
 let createRole<'final, 'role, 'player when 'final : not struct> (player : 'player) = 
     Role<'player,'role>(player).ActLike<'final>()
